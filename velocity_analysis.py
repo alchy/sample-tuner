@@ -1,6 +1,6 @@
 """
-Velocity analýza a globální mapping s podporou stereo handling.
-Obsahuje pokročilé metriky pro velocity detection.
+Modul pro pokročilou velocity analýzu a mapping s podporou stereo.
+Obsahuje analyzátor pro metriky jako RMS, peak a attack křivku, a mapper pro globální velocity úrovně.
 """
 
 import numpy as np
@@ -11,39 +11,31 @@ from audio_utils import VelocityAnalysisResult, AudioSampleData, AudioProcessor
 
 logger = logging.getLogger(__name__)
 
-
 class AdvancedVelocityAnalyzer:
     """
-    Pokročilý velocity analyzer s stereo podporou.
-
-    Vylepšení:
-    - Lepší handling stereo vzorků
-    - Více metrik pro velocity detection
-    - Vektorová matematika
+    Pokročilý analyzer velocity s podporou stereo a attack fáze.
+    Vypočítává metriky pro mapping, jako RMS, peak a dynamický rozsah.
     """
-
     def __init__(self, attack_duration: float = 0.5):
-        self.attack_duration = attack_duration
+        self.attack_duration = attack_duration  # Délka attack fáze v sekundách
 
     def analyze(self, waveform: np.ndarray, sr: int) -> VelocityAnalysisResult:
-        """Kompletní velocity analýza"""
-
-        # Zachovej stereo info, ale získej i mono verzi
+        """
+        Kompletní velocity analýza waveformu, včetně mono konverze pro konzistenci.
+        """
+        # Převedení na mono pro analýzu
         mono_audio = waveform.flatten() if len(waveform.shape) > 1 else waveform
 
-        # Stereo width calculation
+        # Výpočet stereo šířky
         stereo_width = AudioProcessor.calculate_stereo_width(waveform)
 
-        # RMS metrics - použij mono pro konzistenci
+        # RMS a peak metriky
         rms_db = self._calculate_rms_db(mono_audio)
-
-        # Peak metrics
         peak_db = self._calculate_peak_db(mono_audio)
 
-        # Attack phase metrics
+        # Attack fáze metriky
         attack_samples = int(sr * self.attack_duration)
         attack_samples = min(attack_samples, len(mono_audio))
-
         if attack_samples > 0:
             attack_section = mono_audio[:attack_samples]
             attack_peak_db = self._calculate_peak_db(attack_section)
@@ -52,7 +44,7 @@ class AdvancedVelocityAnalyzer:
             attack_peak_db = peak_db
             attack_rms_db = rms_db
 
-        # Dynamic range
+        # Dynamický rozsah
         dynamic_range = peak_db - rms_db if rms_db != -np.inf else 0
 
         return VelocityAnalysisResult(
@@ -65,35 +57,30 @@ class AdvancedVelocityAnalyzer:
         )
 
     def _calculate_rms_db(self, audio: np.ndarray) -> float:
-        """RMS výpočet"""
+        """
+        Vypočítá RMS v dB s ochranou proti nulovým signálům.
+        """
         if len(audio) == 0:
             return -np.inf
-
-        # Vectorized RMS calculation
         rms_squared = np.mean(audio ** 2)
-
-        if rms_squared <= 1e-10:  # Ochrana proti velmi tichým signálům
+        if rms_squared <= 1e-10:
             return -np.inf
-
-        return 10 * np.log10(rms_squared)  # 10*log10 pro power, 20*log10 by bylo pro amplitudu
+        return 10 * np.log10(rms_squared)
 
     def _calculate_peak_db(self, audio: np.ndarray) -> float:
-        """Peak výpočet"""
+        """
+        Vypočítá peak v dB s ochranou proti nulovým signálům.
+        """
         if len(audio) == 0:
             return -np.inf
-
-        # Vectorized peak calculation
         peak = np.max(np.abs(audio))
-
-        if peak <= 1e-10:  # Ochrana proti velmi tichým signálům
+        if peak <= 1e-10:
             return -np.inf
-
-        return 20 * np.log10(peak)  # 20*log10 pro amplitudu
+        return 20 * np.log10(peak)
 
     def analyze_attack_curve(self, waveform: np.ndarray, sr: int) -> Dict:
         """
-        Pokročilá analýza attack křivky pro velocity detection.
-        Vrací detailní metriky o nástupu zvuku.
+        Pokročilá analýza attack křivky pro velocity, včetně slope a sharpness.
         """
         mono_audio = waveform.flatten() if len(waveform.shape) > 1 else waveform
 
@@ -106,46 +93,33 @@ class AdvancedVelocityAnalyzer:
 
         attack_section = mono_audio[:attack_samples]
 
-        # Najdi skutečný začátek signálu (nad noise floor)
+        # Najdi začátek signálu nad noise floor
         abs_attack = np.abs(attack_section)
-        noise_floor = np.percentile(abs_attack, 10)  # 10% percentil jako noise floor
-
-        # Najdi první vzorky nad noise floor
+        noise_floor = np.percentile(abs_attack, 10)
         signal_start = np.where(abs_attack > noise_floor * 3)[0]
         if len(signal_start) == 0:
             return {"attack_slope": 0.0, "attack_time": 0.0, "attack_sharpness": 0.0}
 
         start_idx = signal_start[0]
-
-        # Najdi peak
         peak_idx = np.argmax(abs_attack[start_idx:]) + start_idx
 
         if peak_idx <= start_idx:
             return {"attack_slope": 0.0, "attack_time": 0.0, "attack_sharpness": 0.0}
 
-        # Attack time (čas do peaku)
+        # Attack time a slope
         attack_time = (peak_idx - start_idx) / sr
-
-        # Attack slope (strmost nárůstu)
-        if attack_time > 0:
-            peak_value = abs_attack[peak_idx]
-            start_value = abs_attack[start_idx]
-            attack_slope = (peak_value - start_value) / attack_time
-        else:
-            attack_slope = 0.0
+        peak_value = abs_attack[peak_idx]
+        start_value = abs_attack[start_idx]
+        attack_slope = (peak_value - start_value) / attack_time if attack_time > 0 else 0.0
 
         # Attack sharpness (druhá derivace)
+        attack_sharpness = 0.0
         if peak_idx > start_idx + 1:
             attack_curve = abs_attack[start_idx:peak_idx+1]
             if len(attack_curve) > 2:
-                # Druhá derivace jako míra "ostrosti" attack
                 first_diff = np.diff(attack_curve)
                 second_diff = np.diff(first_diff)
                 attack_sharpness = np.mean(np.abs(second_diff))
-            else:
-                attack_sharpness = 0.0
-        else:
-            attack_sharpness = 0.0
 
         return {
             "attack_slope": attack_slope,
@@ -155,71 +129,41 @@ class AdvancedVelocityAnalyzer:
             "peak_idx": peak_idx
         }
 
-
 class OptimizedVelocityMapper:
     """
-    Globální velocity mapper s pokročilými metrikami.
-
-    Vylepšení:
-    - Podporuje více metrik současně
-    - Adaptivní thresholding
-    - Lepší distribuce velocity hodnot
+    Globální mapper velocity s podporou multiple metrik a adaptivního thresholding.
     """
-
     @staticmethod
     def create_advanced_mapping(samples: List[AudioSampleData],
                               primary_metric: str = "attack_peak_db",
                               secondary_metric: Optional[str] = "attack_slope",
                               num_velocities: int = 8) -> Dict:
         """
-        Vytvoří pokročilý velocity mapping s multiple metriky.
-
-        Args:
-            samples: Seznam vzorků
-            primary_metric: Hlavní metrika pro velocity
-            secondary_metric: Sekundární metrika pro tie-breaking
-            num_velocities: Počet velocity úrovní
+        Vytvoří pokročilý velocity mapping s multiple metrikami a outlier removal.
         """
-
-        # Extrakce primární metriky
         primary_values = []
         secondary_values = []
-
-        # Pro advanced metriky budeme potřebovat analyzer
         velocity_analyzer = AdvancedVelocityAnalyzer()
 
         for sample in samples:
             if sample.velocity_analysis is None:
                 continue
 
-            # Primární metrika
             primary_value = OptimizedVelocityMapper._extract_metric_value(
                 sample, primary_metric, velocity_analyzer
             )
-
             if primary_value is not None and primary_value != -np.inf:
                 primary_values.append(primary_value)
 
-                # Sekundární metrika pro tie-breaking
-                if secondary_metric:
-                    secondary_value = OptimizedVelocityMapper._extract_metric_value(
-                        sample, secondary_metric, velocity_analyzer
-                    )
-                    secondary_values.append(secondary_value if secondary_value is not None else 0.0)
-                else:
-                    secondary_values.append(0.0)
+                secondary_value = OptimizedVelocityMapper._extract_metric_value(
+                    sample, secondary_metric, velocity_analyzer
+                ) if secondary_metric else 0.0
+                secondary_values.append(secondary_value if secondary_value is not None else 0.0)
 
         if len(primary_values) < 2:
             logger.warning("Nedostatek dat pro velocity mapping")
-            return {
-                "thresholds": [],
-                "min_value": 0,
-                "max_value": 0,
-                "primary_metric": primary_metric,
-                "secondary_metric": secondary_metric
-            }
+            return {"thresholds": [], "min_value": 0, "max_value": 0, "primary_metric": primary_metric, "secondary_metric": secondary_metric}
 
-        # Adaptivní thresholding - kombinace percentilů a uniform distribution
         primary_values = np.array(primary_values)
 
         # Odstranění outliers (5% z každé strany)
@@ -229,32 +173,21 @@ class OptimizedVelocityMapper:
         if len(filtered_values) < 2:
             filtered_values = primary_values
 
-        min_value = np.min(filtered_values)
-        max_value = np.max(filtered_values)
+        min_value = float(np.min(filtered_values))
+        max_value = float(np.max(filtered_values))
 
-        # Vytvoř thresholdy - kombinace uniform a percentile-based
-        thresholds = []
+        # Hybridní thresholds (uniform + percentile)
+        uniform_thresholds = np.linspace(min_value, max_value, num_velocities)
+        percentile_points = np.linspace(0, 100, num_velocities)
+        percentile_thresholds = np.percentile(filtered_values, percentile_points)
 
-        if num_velocities <= 1:
-            thresholds = [min_value]
-        else:
-            # Hybrid approach: část uniform, část percentile-based
-            uniform_thresholds = np.linspace(min_value, max_value, num_velocities)
-            percentile_points = np.linspace(0, 100, num_velocities)
-            percentile_thresholds = np.percentile(filtered_values, percentile_points)
-
-            # Váha pro kombinaci (více uniform pro malé datasety)
-            uniform_weight = 0.7 if len(filtered_values) < 50 else 0.3
-
-            for i in range(num_velocities):
-                threshold = (uniform_weight * uniform_thresholds[i] +
-                           (1 - uniform_weight) * percentile_thresholds[i])
-                thresholds.append(threshold)
+        uniform_weight = 0.7 if len(filtered_values) < 50 else 0.3
+        thresholds = (uniform_weight * uniform_thresholds + (1 - uniform_weight) * percentile_thresholds)
 
         return {
-            "thresholds": thresholds,
-            "min_value": float(min_value),
-            "max_value": float(max_value),
+            "thresholds": thresholds.tolist(),
+            "min_value": min_value,
+            "max_value": max_value,
             "primary_metric": primary_metric,
             "secondary_metric": secondary_metric,
             "num_samples": len(primary_values),
@@ -264,8 +197,9 @@ class OptimizedVelocityMapper:
     @staticmethod
     def _extract_metric_value(sample: AudioSampleData, metric: str,
                             velocity_analyzer: AdvancedVelocityAnalyzer) -> Optional[float]:
-        """Extrahuje hodnotu metriky ze vzorku"""
-
+        """
+        Extrahuje hodnotu metriky ze sample, včetně pokročilých attack metrik.
+        """
         if metric == "attack_peak_db":
             return sample.velocity_analysis.attack_peak_db
         elif metric == "peak_db":
@@ -277,15 +211,10 @@ class OptimizedVelocityMapper:
         elif metric == "stereo_width":
             return sample.velocity_analysis.stereo_width
         elif metric in ["attack_slope", "attack_time", "attack_sharpness"]:
-            # Pro advanced metriky potřebujeme přepočítat
-            try:
-                attack_analysis = velocity_analyzer.analyze_attack_curve(
-                    sample.waveform, sample.sample_rate
-                )
-                return attack_analysis.get(metric, 0.0)
-            except Exception as e:
-                logger.warning(f"Failed to compute {metric}: {e}")
-                return 0.0
+            attack_analysis = velocity_analyzer.analyze_attack_curve(
+                sample.waveform, sample.sample_rate
+            )
+            return attack_analysis.get(metric, 0.0)
         else:
             logger.warning(f"Unknown metric: {metric}")
             return None
@@ -294,7 +223,7 @@ class OptimizedVelocityMapper:
     def assign_velocity_advanced(sample: AudioSampleData, mapping: Dict,
                                velocity_analyzer: Optional[AdvancedVelocityAnalyzer] = None) -> int:
         """
-        Přiřazení velocity s multiple metrikami.
+        Přiřadí velocity na základě primary a secondary metriky s fine-tuningem.
         """
         if not mapping["thresholds"]:
             return 0
@@ -302,7 +231,6 @@ class OptimizedVelocityMapper:
         if velocity_analyzer is None:
             velocity_analyzer = AdvancedVelocityAnalyzer()
 
-        # Primární metrika
         primary_value = OptimizedVelocityMapper._extract_metric_value(
             sample, mapping["primary_metric"], velocity_analyzer
         )
@@ -310,41 +238,29 @@ class OptimizedVelocityMapper:
         if primary_value is None or primary_value == -np.inf:
             return 0
 
-        # Najdi velocity podle primární metriky
-        velocity = 0
-        for i, threshold in enumerate(mapping["thresholds"]):
-            if primary_value >= threshold:
-                velocity = i
+        velocity = np.searchsorted(mapping["thresholds"], primary_value)
 
-        # Sekundární metrika pro fine-tuning (pokud jsou dva vzorky blízko)
+        # Fine-tuning s secondary metrikou
         if mapping.get("secondary_metric"):
             secondary_value = OptimizedVelocityMapper._extract_metric_value(
                 sample, mapping["secondary_metric"], velocity_analyzer
             )
-
-            if secondary_value is not None:
-                # Pokud jsme na hranici mezi dvěma velocity, použij sekundární metriku
-                threshold_tolerance = 0.05  # 5% tolerance
-
-                if velocity < len(mapping["thresholds"]) - 1:
-                    current_threshold = mapping["thresholds"][velocity]
-                    next_threshold = mapping["thresholds"][velocity + 1]
-                    threshold_range = next_threshold - current_threshold
-
-                    # Pokud jsme blízko následujícímu prahu
-                    if (next_threshold - primary_value) < (threshold_tolerance * threshold_range):
-                        # Pokud sekundární metrika je vysoká, zvyš velocity
-                        if secondary_value > 0.5:  # Arbitrary threshold
-                            velocity = min(velocity + 1, len(mapping["thresholds"]) - 1)
+            if secondary_value is not None and velocity < len(mapping["thresholds"]) - 1:
+                current_threshold = mapping["thresholds"][velocity]
+                next_threshold = mapping["thresholds"][velocity + 1]
+                threshold_range = next_threshold - current_threshold
+                if (next_threshold - primary_value) < 0.05 * threshold_range and secondary_value > 0.5:
+                    velocity += 1
 
         return min(velocity, len(mapping["thresholds"]) - 1)
 
     @staticmethod
     def analyze_velocity_distribution(samples: List[AudioSampleData], mapping: Dict) -> Dict:
-        """Analýza distribuce velocity hodnot pro debugging"""
-
+        """
+        Analýza distribuce velocity pro debugging a statistiky.
+        """
         velocity_counts = defaultdict(int)
-        velocity_values = defaultdict(list)  # Pro statistiky hodnot v každé velocity
+        velocity_values = defaultdict(list)
 
         velocity_analyzer = AdvancedVelocityAnalyzer()
 
@@ -364,28 +280,16 @@ class OptimizedVelocityMapper:
             if primary_value is not None and primary_value != -np.inf:
                 velocity_values[velocity].append(primary_value)
 
-        # Statistiky pro každou velocity
         velocity_stats = {}
         for vel in range(len(mapping["thresholds"])):
-            count = velocity_counts[vel]
             values = velocity_values[vel]
-
-            if values:
-                velocity_stats[vel] = {
-                    "count": count,
-                    "mean": np.mean(values),
-                    "std": np.std(values),
-                    "min": np.min(values),
-                    "max": np.max(values)
-                }
-            else:
-                velocity_stats[vel] = {
-                    "count": 0,
-                    "mean": 0,
-                    "std": 0,
-                    "min": 0,
-                    "max": 0
-                }
+            velocity_stats[vel] = {
+                "count": velocity_counts[vel],
+                "mean": np.mean(values) if values else 0,
+                "std": np.std(values) if values else 0,
+                "min": np.min(values) if values else 0,
+                "max": np.max(values) if values else 0
+            }
 
         return {
             "velocity_counts": dict(velocity_counts),

@@ -1,372 +1,332 @@
 """
-Audio utility funkce, data struktury a základní audio processing.
-Obsahuje filtry s dynamickým sample rate a audio handling.
+Utility modul pro audio zpracování, včetně datových struktur a procesorů.
+Tento soubor obsahuje společné třídy a funkce pro celý systém, jako je konverze MIDI, normalizace audio a směrové ladění.
 """
 
 import numpy as np
-import resampy
+from typing import Optional, List, Dict, Tuple
+from enum import Enum
 import logging
-from typing import Optional, Tuple, List
-from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path  # Import pro práci s cestami k souborům
 
 logger = logging.getLogger(__name__)
 
+# Globální konfigurace směru ladění
+class TuneDirection(Enum):
+    """
+    Enum pro směr ladění MIDI not.
+    """
+    UP = "up"        # Vždy ladit směrem nahoru k vyšší MIDI notě
+    DOWN = "down"    # Vždy ladit směrem dolů k nižší MIDI notě
+    NEAREST = "nearest"  # Ladit k nejbližší MIDI notě (default)
 
-@dataclass
+# Globální konfigurace filtru kláves
+class KeyFilter(Enum):
+    """
+    Enum pro filtr kláves na piano.
+    """
+    ALL = "all"          # Všechny klávesy (bílé i černé)
+    WHITE_ONLY = "white"  # Pouze bílé klávesy
+    BLACK_ONLY = "black"  # Pouze černé klávesy
+
 class PitchAnalysisResult:
-    """Výsledek pitch analýzy s detailními metrikami"""
-    fundamental_freq: Optional[float]
-    confidence: float
-    harmonics: List[float]
-    method_used: str
-    spectral_centroid: float
-    spectral_rolloff: float
-    spectrum: Optional[np.ndarray] = None  # Cached spectrum pro opakované použití
-    freqs: Optional[np.ndarray] = None    # Cached frequencies
+    """
+    Výsledek analýzy pitchu, včetně základní frekvence a dalších metrik.
+    """
+    def __init__(self, fundamental_freq: Optional[float], confidence: float,
+                 harmonics: List[float], method_used: str,
+                 spectral_centroid: float, spectral_rolloff: float):
+        self.fundamental_freq = fundamental_freq  # Základní detekovaná frekvence
+        self.confidence = confidence  # Míra spolehlivosti detekce
+        self.harmonics = harmonics  # Seznam harmonických frekvencí
+        self.method_used = method_used  # Použitá metoda detekce (např. 'crepe_hybrid')
+        self.spectral_centroid = spectral_centroid  # Spektrální centroid
+        self.spectral_rolloff = spectral_rolloff  # Spektrální rolloff
 
-    @property
-    def midi_note(self) -> Optional[int]:
-        if self.fundamental_freq is None:
-            return None
-        return AudioUtils.freq_to_midi(self.fundamental_freq)
-
-
-@dataclass
 class VelocityAnalysisResult:
-    """Výsledek velocity analýzy"""
-    rms_db: float
-    peak_db: float
-    attack_peak_db: float
-    attack_rms_db: float
-    dynamic_range: float
-    stereo_width: Optional[float] = None  # Pro stereo vzorky
+    """
+    Výsledek analýzy velocity, včetně RMS, peak a dalších metrik.
+    """
+    def __init__(self, rms_db: float, peak_db: float, attack_peak_db: float,
+                 attack_rms_db: float, dynamic_range: float, stereo_width: float):
+        self.rms_db = rms_db  # RMS v dB
+        self.peak_db = peak_db  # Peak v dB
+        self.attack_peak_db = attack_peak_db  # Peak v attack fázi
+        self.attack_rms_db = attack_rms_db  # RMS v attack fázi
+        self.dynamic_range = dynamic_range  # Dynamický rozsah
+        self.stereo_width = stereo_width  # Šířka sterea
 
-
-@dataclass
 class AudioSampleData:
-    """Kompletní data audio vzorku"""
-    filepath: Path
-    waveform: np.ndarray
-    sample_rate: int
-    duration: float
-    pitch_analysis: Optional[PitchAnalysisResult]
-    velocity_analysis: Optional[VelocityAnalysisResult]
-    assigned_velocity: Optional[int] = None
-    target_midi_note: Optional[int] = None
-    pitch_correction_semitones: Optional[float] = None
-
+    """
+    Datová struktura pro audio sample, včetně waveformu, analýz a cílových hodnot.
+    """
+    def __init__(self, filepath: Path, waveform: np.ndarray, sample_rate: int, duration: float,
+                 pitch_analysis: Optional[PitchAnalysisResult] = None,
+                 velocity_analysis: Optional[VelocityAnalysisResult] = None,
+                 assigned_velocity: Optional[int] = None,
+                 target_midi_note: Optional[int] = None,
+                 pitch_correction_semitones: Optional[float] = None):
+        self.filepath = filepath  # Cesta k souboru
+        self.waveform = waveform  # Audio data jako numpy array
+        self.sample_rate = sample_rate  # Sample rate (Hz)
+        self.duration = duration  # Délka v sekundách
+        self.pitch_analysis = pitch_analysis  # Výsledek pitch analýzy
+        self.velocity_analysis = velocity_analysis  # Výsledek velocity analýzy
+        self.assigned_velocity = assigned_velocity  # Přiřazená velocity (0-7)
+        self.target_midi_note = target_midi_note  # Cílová MIDI nota
+        self.pitch_correction_semitones = pitch_correction_semitones  # Korekce v půltónech
 
 class AudioUtils:
-    """Audio utility funkce s filtry"""
-
-    MIDI_TO_NOTE = {
-        0: 'C', 1: 'C#', 2: 'D', 3: 'D#', 4: 'E', 5: 'F',
-        6: 'F#', 7: 'G', 8: 'G#', 9: 'A', 10: 'A#', 11: 'B'
-    }
+    """
+    Utility funkce pro manipulaci s audio daty, jako je konverze, normalizace a MIDI převody.
+    """
+    @staticmethod
+    def to_mono(waveform: np.ndarray) -> np.ndarray:
+        """
+        Převede stereo waveform na mono průměrováním kanálů.
+        """
+        if len(waveform.shape) == 2:
+            return np.mean(waveform, axis=1)
+        return waveform
 
     @staticmethod
-    def freq_to_midi(freq: float) -> int:
-        """Převod frekvence na MIDI číslo s validací"""
-        if freq <= 0:
-            raise ValueError("Frekvence musí být kladná")
-        midi_float = 12 * np.log2(freq / 440.0) + 69
-        return int(np.round(midi_float))
-
-    @staticmethod
-    def midi_to_freq(midi: int) -> float:
-        """Převod MIDI čísla na frekvenci"""
-        return 440.0 * 2 ** ((midi - 69) / 12)
-
-    @staticmethod
-    def midi_to_note_name(midi: int) -> str:
-        """Převod MIDI čísla na název noty"""
-        if not (0 <= midi <= 127):
-            raise ValueError(f"MIDI číslo {midi} je mimo rozsah 0-127")
-
-        octave = (midi // 12) - 1
-        note_idx = midi % 12
-        note = AudioUtils.MIDI_TO_NOTE[note_idx]
-        return f"{note}{octave}"
-
-    @staticmethod
-    def normalize_audio(waveform: np.ndarray, target_db: float = -20.0) -> np.ndarray:
-        """Normalizace audio na cílovou úroveň s float32 výstupem"""
-        # Ensure float32 input
-        waveform = waveform.astype(np.float32)
-
-        if len(waveform.shape) > 1:
-            rms = np.sqrt(np.mean(waveform.flatten() ** 2))
-        else:
-            rms = np.sqrt(np.mean(waveform ** 2))
-
+    def normalize_audio(audio: np.ndarray, target_db: float = -20.0) -> np.ndarray:
+        """
+        Normalizuje audio na cílovou úroveň dB pro konzistentní hlasitost.
+        """
+        rms = np.sqrt(np.mean(audio ** 2))
         if rms == 0:
-            return waveform.astype(np.float32)
-
-        target_rms = 10 ** (target_db / 20)
-        normalized = waveform * (target_rms / rms)
-
-        return normalized.astype(np.float32)
-
-    @staticmethod
-    def to_mono(waveform: np.ndarray, method: str = "mean") -> np.ndarray:
-        """
-        Převod na mono s volbou metody a float32 výstupem.
-
-        Args:
-            waveform: Input audio
-            method: 'mean', 'left', 'right', 'mid_side'
-        """
-        # Ensure float32 input
-        waveform = waveform.astype(np.float32)
-
-        if len(waveform.shape) <= 1:
-            return waveform.astype(np.float32)
-
-        if waveform.shape[1] == 1:
-            return waveform[:, 0].astype(np.float32)
-
-        if method == "mean":
-            return np.mean(waveform, axis=1).astype(np.float32)
-        elif method == "left":
-            return waveform[:, 0].astype(np.float32)
-        elif method == "right":
-            return (waveform[:, 1] if waveform.shape[1] > 1 else waveform[:, 0]).astype(np.float32)
-        elif method == "mid_side" and waveform.shape[1] >= 2:
-            # Mid channel pro mono conversion
-            return ((waveform[:, 0] + waveform[:, 1]) / 2).astype(np.float32)
-        else:
-            return np.mean(waveform, axis=1).astype(np.float32)
+            return audio
+        gain_db = target_db - 20 * np.log10(rms)
+        gain = 10 ** (gain_db / 20)
+        gain = 10 ** (gain_db / 20)
+        return audio * gain
 
     @staticmethod
-    def ensure_format(waveform: np.ndarray, target_channels: int = 1) -> np.ndarray:
-        """Zajistí správný formát audio (mono/stereo) s float32 výstupem"""
-        # Ensure float32 input
-        waveform = waveform.astype(np.float32)
-
-        if target_channels == 1:
-            return AudioUtils.to_mono(waveform)
-        elif target_channels == 2:
-            if len(waveform.shape) == 1:
-                # Mono -> stereo (duplicate)
-                return np.column_stack([waveform, waveform]).astype(np.float32)
-            elif waveform.shape[1] == 1:
-                # Mono column -> stereo
-                return np.column_stack([waveform[:, 0], waveform[:, 0]]).astype(np.float32)
-            else:
-                return waveform.astype(np.float32)
-        else:
-            raise ValueError(f"Unsupported channel count: {target_channels}")
+    def midi_to_freq(midi_note: int) -> float:
+        """
+        Převede MIDI notu na frekvenci v Hz (A4 = 440 Hz).
+        """
+        return 440.0 * (2 ** ((midi_note - 69) / 12))
 
     @staticmethod
-    def compute_spectrum(waveform: np.ndarray, sr: int, n_fft: int = 2048) -> Tuple[np.ndarray, np.ndarray]:
+    def midi_to_note_name(midi_note: int) -> str:
         """
-        Výpočet spektra s caching možnostmi a float32 kompatibilitou.
+        Převede MIDI notu na jméno noty (např. 'C4').
         """
-        # Ensure float32 input
-        waveform = waveform.astype(np.float32)
-
-        n_fft = min(n_fft, len(waveform))
-        if n_fft < 64:  # Minimum pro smysluplnou analýzu
-            return np.array([], dtype=np.float32), np.array([], dtype=np.float32)
-
-        # Window pro lepší spektrální rozlišení
-        window = np.hanning(n_fft).astype(np.float32)
-        windowed = waveform[:n_fft] * window
-
-        spectrum = np.abs(np.fft.fft(windowed)).astype(np.float32)
-        freqs = np.fft.fftfreq(n_fft, 1 / sr).astype(np.float32)
-
-        # Pouze pozitivní frekvence
-        half_len = n_fft // 2
-        return spectrum[:half_len], freqs[:half_len]
+        notes = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
+        octave = (midi_note // 12) - 1
+        note_name = notes[midi_note % 12]
+        return f"{note_name}{octave}"
 
     @staticmethod
-    def spectral_features(waveform: np.ndarray, sr: int) -> Tuple[float, float]:
-        """Výpočet spektrálních charakteristik s float32 kompatibilitou"""
-        # Ensure float32 input
-        waveform = waveform.astype(np.float32)
-
-        spectrum, freqs = AudioUtils.compute_spectrum(waveform, sr)
-
-        if len(spectrum) == 0:
-            return 0.0, sr / 2
-
-        # Spektrální centroid
-        total_energy = np.sum(spectrum)
-        if total_energy > 0:
-            centroid = float(np.sum(freqs * spectrum) / total_energy)
-        else:
-            centroid = 0.0
-
-        # Spektrální rolloff (85% energie)
-        cumsum_spectrum = np.cumsum(spectrum)
-        if cumsum_spectrum[-1] > 0:
-            rolloff_threshold = 0.85 * cumsum_spectrum[-1]
-            rolloff_idx = np.where(cumsum_spectrum >= rolloff_threshold)[0]
-            rolloff = float(freqs[rolloff_idx[0]]) if len(rolloff_idx) > 0 else sr / 2
-        else:
-            rolloff = sr / 2
-
+    def spectral_features(audio: np.ndarray, sr: int) -> Tuple[float, float]:
+        """
+        Vypočítá spektrální centroid a rolloff pro analýzu spektra.
+        """
+        # Dummy implementace – v reálu použij librosa nebo podobné
+        centroid = np.mean(np.fft.fftfreq(len(audio), 1/sr) * np.abs(np.fft.fft(audio)))
+        rolloff = centroid * 1.5  # Přibližný výpočet
         return centroid, rolloff
 
-
-class OptimizedFilters:
-    """
-    Filtry s dynamickým sample rate.
-    Používá skutečný sample rate místo hardcoded hodnot.
-    """
-
     @staticmethod
-    def apply_processing_filters(audio: np.ndarray, sr: int) -> np.ndarray:
-        """Aplikuje kompletnú sadu filtrů pro pitch detekci"""
-
-        # 1. High-pass filter - odstranění DC a velmi nízkých frekvencí
-        audio = OptimizedFilters.highpass_filter(audio, sr, cutoff_hz=40.0)
-
-        # 2. Notch filter pro síťové brumání (50/60 Hz)
-        audio = OptimizedFilters.notch_filter(audio, sr, freq=50.0, quality=10.0)
-        audio = OptimizedFilters.notch_filter(audio, sr, freq=60.0, quality=10.0)
-
-        # 3. Gentle low-pass pro redukci vysokofrekvenčního šumu
-        audio = OptimizedFilters.lowpass_filter(audio, sr, cutoff_hz=8000.0)
-
-        return audio
-
-    @staticmethod
-    def highpass_filter(audio: np.ndarray, sr: int, cutoff_hz: float) -> np.ndarray:
-        """High-pass filter s dynamickým sample rate"""
-        if len(audio) < 10:
-            return audio
-
-        # RC high-pass filter s cutoff frekvencí
-        dt = 1.0 / sr
-        rc = 1.0 / (2 * np.pi * cutoff_hz)
-        alpha = rc / (rc + dt)
-
-        # Aplikace filtru
-        filtered = np.zeros_like(audio)
-        filtered[0] = audio[0]
-
-        for i in range(1, len(audio)):
-            filtered[i] = alpha * (filtered[i-1] + audio[i] - audio[i-1])
-
-        return filtered
-
-    @staticmethod
-    def lowpass_filter(audio: np.ndarray, sr: int, cutoff_hz: float) -> np.ndarray:
-        """Low-pass filter s dynamickým sample rate"""
-        if len(audio) < 10:
-            return audio
-
-        # RC low-pass filter
-        dt = 1.0 / sr
-        rc = 1.0 / (2 * np.pi * cutoff_hz)
-        alpha = dt / (rc + dt)
-
-        # Aplikace filtru
-        filtered = np.zeros_like(audio)
-        filtered[0] = audio[0]
-
-        for i in range(1, len(audio)):
-            filtered[i] = filtered[i-1] + alpha * (audio[i] - filtered[i-1])
-
-        return filtered
-
-    @staticmethod
-    def notch_filter(audio: np.ndarray, sr: int, freq: float, quality: float = 10.0) -> np.ndarray:
-        """Notch filter s dynamickým sample rate"""
-        if len(audio) < 10:
-            return audio
-
-        # Vytvoř sinusovou vlnu na cílové frekvenci
-        t = np.arange(len(audio)) / sr
-
-        # Detekce amplitudy na cílové frekvenci pomocí korelace
-        test_sin = np.sin(2 * np.pi * freq * t)
-        test_cos = np.cos(2 * np.pi * freq * t)
-
-        # Projekce signálu na sin/cos komponenty
-        sin_coeff = np.dot(audio, test_sin) / len(audio)
-        cos_coeff = np.dot(audio, test_cos) / len(audio)
-
-        # Rekonstrukce komponenty na cílové frekvenci
-        target_component = sin_coeff * test_sin + cos_coeff * test_cos
-
-        # Odečtení (s faktorem útlumu)
-        attenuation = 1.0 / quality  # Vyšší Q = větší útlum
-        filtered = audio - attenuation * target_component
-
-        return filtered
-
-
-# Opravy pro AudioProcessor třídu v audio_utils.py
+    def compute_spectrum(audio: np.ndarray, sr: int, n_fft: int = 8192) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Vypočítá spektrum audio signálu pomocí FFT.
+        """
+        if len(audio) < n_fft:
+            audio = np.pad(audio, (0, n_fft - len(audio)))
+        spectrum = np.abs(np.fft.fft(audio[:n_fft]))
+        freqs = np.fft.fftfreq(n_fft, 1/sr)
+        return spectrum[:n_fft//2], freqs[:n_fft//2]
 
 class AudioProcessor:
     """
-    Unified audio processor pro stereo/mono handling a sample rate conversion s float32 kompatibilitou.
+    Procesor pro pokročilé operace s audio, jako je výpočet stereo šířky.
     """
+    @staticmethod
+    def calculate_stereo_width(waveform: np.ndarray) -> float:
+        """
+        Vypočítá šířku stereo signálu na základě mid-side analýzy.
+        """
+        if len(waveform.shape) != 2 or waveform.shape[1] != 2:
+            return 0.0
+        left, right = waveform[:, 0], waveform[:, 1]
+        mid = (left + right) / 2
+        side = (left - right) / 2
+        mid_mean = np.mean(np.abs(mid))
+        if mid_mean == 0:
+            return 0.0
+        return np.mean(np.abs(side)) / mid_mean
+
+class DirectionalTuner:
+    """
+    Pomocná třída pro směrové ladění MIDI not s filtrem kláves podle specifikace v README.
+    """
+    # MIDI noty pro bílé klávesy (C, D, E, F, G, A, B)
+    WHITE_KEY_NOTES = {0, 2, 4, 5, 7, 9, 11}  # Chromatic positions within octave
+    # MIDI noty pro černé klávesy (C#, D#, F#, G#, A#)
+    BLACK_KEY_NOTES = {1, 3, 6, 8, 10}  # Chromatic positions within octave
 
     @staticmethod
-    def resample_audio(audio: np.ndarray, from_sr: int, to_sr: int) -> np.ndarray:
-        """Univerzální resampling pro mono i stereo s float32 výstupem"""
-        if from_sr == to_sr:
-            return audio.astype(np.float32)
+    def is_white_key(midi_note: int) -> bool:
+        """
+        Zkontroluje, zda je MIDI nota bílá klávesa.
+        """
+        return (midi_note % 12) in DirectionalTuner.WHITE_KEY_NOTES
 
-        # Ensure float32 input
-        audio = audio.astype(np.float32)
+    @staticmethod
+    def is_black_key(midi_note: int) -> bool:
+        """
+        Zkontroluje, zda je MIDI nota černá klávesa.
+        """
+        return (midi_note % 12) in DirectionalTuner.BLACK_KEY_NOTES
 
+    @staticmethod
+    def matches_key_filter(midi_note: int, key_filter: KeyFilter) -> bool:
+        """
+        Zkontroluje, zda MIDI nota odpovídá zvolenému filtru kláves.
+        """
+        if key_filter == KeyFilter.ALL:
+            return True
+        elif key_filter == KeyFilter.WHITE_ONLY:
+            return DirectionalTuner.is_white_key(midi_note)
+        elif key_filter == KeyFilter.BLACK_ONLY:
+            return DirectionalTuner.is_black_key(midi_note)
+        return False
+
+    @staticmethod
+    def find_target_midi_directional(freq: float, direction: TuneDirection,
+                                     piano_frequencies: np.ndarray,
+                                     key_filter: KeyFilter = KeyFilter.ALL) -> Optional[int]:
+        """
+        Najde cílovou MIDI notu podle směru ladění a filtru kláves, s logováním pro debugging.
+        """
         try:
-            if len(audio.shape) > 1 and audio.shape[1] > 1:
-                # Multi-channel
-                resampled_channels = []
-                for ch in range(audio.shape[1]):
-                    resampled = resampy.resample(audio[:, ch], from_sr, to_sr)
-                    resampled_channels.append(resampled.astype(np.float32))
-                return np.column_stack(resampled_channels)
-            else:
-                # Mono
-                audio_1d = audio.flatten() if len(audio.shape) > 1 else audio
-                resampled = resampy.resample(audio_1d, from_sr, to_sr).astype(np.float32)
-                return resampled[:, np.newaxis] if len(audio.shape) > 1 else resampled
+            # Vypočet plovoucí MIDI hodnoty z frekvence
+            midi_float = 12 * np.log2(freq / 440.0) + 69
 
-        except Exception as e:
-            logger.error(f"Resampling error: {e}")
-            return audio.astype(np.float32)
+            if direction == TuneDirection.NEAREST:
+                target_midi = int(np.round(midi_float))
+            elif direction == TuneDirection.UP:
+                target_midi = int(np.ceil(midi_float))
+            else:  # TuneDirection.DOWN
+                target_midi = int(np.floor(midi_float))
 
-    @staticmethod
-    def pitch_shift(audio: np.ndarray, sr: int, semitones: float) -> Tuple[np.ndarray, int]:
-        """Pitch shift s unified handling a float32 výstupem"""
-        if abs(semitones) < 0.01:
-            return audio.astype(np.float32), sr
+            # Aplikace filtru kláves, pokud je specifikován
+            if key_filter != KeyFilter.ALL:
+                target_midi = DirectionalTuner._find_key_in_direction(
+                    target_midi, direction, key_filter
+                )
+                if target_midi is None:
+                    key_type = "white" if key_filter == KeyFilter.WHITE_ONLY else "black"
+                    logger.warning(f"Cannot find {key_type} key in specified direction")
+                    return None
 
-        # Ensure float32 input
-        audio = audio.astype(np.float32)
+            # Validace MIDI rozsahu (0-127, piano 21-108)
+            if not (0 <= target_midi <= 127):
+                logger.warning(f"Target MIDI {target_midi} outside valid range")
+                return None
+            if not (21 <= target_midi <= 108):
+                logger.warning(f"Target MIDI {target_midi} outside piano range (21-108)")
+                return None
 
-        factor = 2 ** (semitones / 12)
-        new_sr = int(sr * factor)
+            # Logování výsledku pro debugging
+            target_freq = AudioUtils.midi_to_freq(target_midi)
+            cents_correction = 1200 * np.log2(target_freq / freq)
+            note_name = AudioUtils.midi_to_note_name(target_midi)
+            direction_str = direction.value.upper()
+            key_filter_str = " (WHITE KEYS ONLY)" if key_filter == KeyFilter.WHITE_ONLY else " (BLACK KEYS ONLY)" if key_filter == KeyFilter.BLACK_ONLY else ""
+            key_type = "WHITE" if DirectionalTuner.is_white_key(target_midi) else "BLACK"
 
-        try:
-            resampled = AudioProcessor.resample_audio(audio, sr, new_sr)
-            return resampled.astype(np.float32), new_sr
-        except Exception as e:
-            logger.error(f"Pitch shift error: {e}")
-            return audio.astype(np.float32), sr
+            logger.info(f"Directional tuning ({direction_str}{key_filter_str}): {freq:.2f} Hz -> MIDI {target_midi} ({note_name}) = {target_freq:.2f} Hz [{key_type} KEY]")
+            logger.info(f"Required correction: {cents_correction:+.1f} cents")
 
-    @staticmethod
-    def calculate_stereo_width(waveform: np.ndarray) -> Optional[float]:
-        """Výpočet stereo width pro velocity analýzu s float32 kompatibilitou"""
-        # Ensure float32 input
-        waveform = waveform.astype(np.float32)
+            return target_midi
 
-        if len(waveform.shape) < 2 or waveform.shape[1] < 2:
+        except (ValueError, OverflowError) as e:
+            logger.error(f"Error in directional MIDI calculation for {freq:.2f} Hz: {e}")
             return None
 
-        left = waveform[:, 0]
-        right = waveform[:, 1]
+    @staticmethod
+    def _find_key_in_direction(midi_note: int, direction: TuneDirection,
+                               key_filter: KeyFilter) -> Optional[int]:
+        """
+        Najde nejbližší klávesu odpovídajícího typu ve specifikovaném směru, s limitem hledání.
+        """
+        if DirectionalTuner.matches_key_filter(midi_note, key_filter):
+            return midi_note
 
-        # Korelace mezi kanály (1.0 = mono, 0.0 = nezávislé, -1.0 = opačné)
-        correlation = np.corrcoef(left, right)[0, 1]
+        search_range = 6  # Maximálně 6 půltónů pro hledání
 
-        # Stereo width (vyšší = více stereo)
-        return float(1.0 - abs(correlation))
+        if direction == TuneDirection.NEAREST:
+            candidates = []
+
+            # Hledání nahoru
+            for offset in range(1, search_range + 1):
+                candidate = midi_note + offset
+                if candidate > 127:
+                    break
+                if DirectionalTuner.matches_key_filter(candidate, key_filter):
+                    candidates.append((candidate, offset))
+
+            # Hledání dolů
+            for offset in range(1, search_range + 1):
+                candidate = midi_note - offset
+                if candidate < 0:
+                    break
+                if DirectionalTuner.matches_key_filter(candidate, key_filter):
+                    candidates.append((candidate, offset))
+
+            if candidates:
+                return min(candidates, key=lambda x: x[1])[0]
+
+        elif direction == TuneDirection.UP:
+            for offset in range(1, search_range + 1):
+                candidate = midi_note + offset
+                if candidate > 127:
+                    break
+                if DirectionalTuner.matches_key_filter(candidate, key_filter):
+                    return candidate
+
+        else:  # TuneDirection.DOWN
+            for offset in range(1, search_range + 1):
+                candidate = midi_note - offset
+                if candidate < 0:
+                    break
+                if DirectionalTuner.matches_key_filter(candidate, key_filter):
+                    return candidate
+
+        key_type = "white" if key_filter == KeyFilter.WHITE_ONLY else "black"
+        logger.warning(f"Cannot find {key_type} key in direction {direction.value} from MIDI {midi_note}")
+        return None
+
+    @staticmethod
+    def validate_directional_tuning(detected_freq: float, target_midi: int,
+                                    direction: TuneDirection, key_filter: KeyFilter = KeyFilter.ALL) -> bool:
+        """
+        Validuje, zda směrové ladění a filtr kláves odpovídají požadavkům, s logováním chyb.
+        """
+        target_freq = AudioUtils.midi_to_freq(target_midi)
+
+        # Validace směru frekvence (pro NEAREST se nevaliduje)
+        freq_correct = True
+        if direction == TuneDirection.UP:
+            freq_correct = target_freq >= detected_freq
+            if not freq_correct:
+                logger.warning(f"Direction validation failed: UP but target {target_freq:.2f} Hz < detected {detected_freq:.2f} Hz")
+        elif direction == TuneDirection.DOWN:
+            freq_correct = target_freq <= detected_freq
+            if not freq_correct:
+                logger.warning(f"Direction validation failed: DOWN but target {target_freq:.2f} Hz > detected {detected_freq:.2f} Hz")
+
+        # Validace filtru kláves
+        key_correct = DirectionalTuner.matches_key_filter(target_midi, key_filter)
+        if not key_correct:
+            note_name = AudioUtils.midi_to_note_name(target_midi)
+            if key_filter == KeyFilter.WHITE_ONLY:
+                logger.warning(f"White key validation failed: MIDI {target_midi} ({note_name}) is not a white key")
+            elif key_filter == KeyFilter.BLACK_ONLY:
+                logger.warning(f"Black key validation failed: MIDI {target_midi} ({note_name}) is not a black key")
+
+        return freq_correct and key_correct
