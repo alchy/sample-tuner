@@ -233,7 +233,25 @@ class RefactoredPitchCorrector:
         midi = pitch.midi_note
         note_name = AudioUtils.midi_to_note_name(midi) if midi else "N/A"
 
-        logger.info(f"  Pitch: {freq:.2f} Hz -> MIDI {midi} ({note_name})")
+        logger.info(f"  Detected frequency: {freq:.2f} Hz -> MIDI {midi} ({note_name})")
+
+        # Vypočítej a zobraz target frekvenci a rozdíl
+        if midi is not None:
+            target_freq = AudioUtils.midi_to_freq(midi)
+            freq_diff = freq - target_freq
+            semitone_correction = 12 * np.log2(target_freq / freq)
+            cents_correction = semitone_correction * 100
+
+            logger.info(f"  Target frequency:   {target_freq:.2f} Hz")
+            logger.info(f"  Frequency difference: {freq_diff:+.2f} Hz")
+            logger.info(f"  Required correction: {semitone_correction:+.3f} semitones ({cents_correction:+.1f} cents)")
+
+            # Informace o tom, zda bude korekce aplikována
+            if abs(cents_correction) < self.min_correction_cents:
+                logger.info(f"  → Correction will be SKIPPED (below {self.min_correction_cents:.1f} cent threshold)")
+            else:
+                logger.info(f"  → Correction will be APPLIED")
+
         logger.info(f"  Confidence: {pitch.confidence:.3f}, Method: {pitch.method_used}")
         logger.info(f"  Attack Peak: {velocity.attack_peak_db:.2f} dB")
         logger.info(f"  Harmonics: {len(pitch.harmonics)}")
