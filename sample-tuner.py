@@ -11,11 +11,11 @@ from collections import defaultdict
 from pathlib import Path
 import logging
 import sys
-from typing import List, Dict, Optional, Tuple
+from typing import Optional, List, Tuple, Dict
 
 # Import našich modulů
 from audio_utils import AudioSampleData, AudioUtils, AudioProcessor
-from piano_pitch_detector import PianoPitchDetector
+from piano_pitch_detector import CrepeHybridDetector  # ZMĚNA: Použij CREPE hybrid
 from velocity_analysis import AdvancedVelocityAnalyzer, OptimizedVelocityMapper
 
 # Konfigurace loggingu
@@ -63,8 +63,7 @@ class TwoPhaseRefactoredPitchCorrector:
 
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
-        # Inicializace komponent - pouze piano detector
-        self.pitch_detector_type = "piano"  # Fixed - pouze piano
+        # Inicializace komponent
         self.pitch_detector = None
         self.velocity_analyzer = AdvancedVelocityAnalyzer(attack_duration)
 
@@ -72,7 +71,6 @@ class TwoPhaseRefactoredPitchCorrector:
         if verbose:
             logger.setLevel(logging.DEBUG)
             logging.getLogger('audio_utils').setLevel(logging.DEBUG)
-            logging.getLogger('pitch_detection').setLevel(logging.DEBUG)
             logging.getLogger('piano_pitch_detector').setLevel(logging.DEBUG)
             logging.getLogger('velocity_analysis').setLevel(logging.DEBUG)
 
@@ -82,7 +80,6 @@ class TwoPhaseRefactoredPitchCorrector:
             logger.info("=== TWO-PHASE PITCH CORRECTOR ===")
             logger.info(f"Input: {self.input_dir}")
             logger.info(f"Output: {self.output_dir}")
-            logger.info(f"Planned pitch detector: piano (only option)")
             logger.info(f"Minimum correction threshold: {self.min_correction_cents:.1f} cents")
 
             # === FÁZE 1: RYCHLÁ ANALÝZA AMPLITUD ===
@@ -119,6 +116,42 @@ class TwoPhaseRefactoredPitchCorrector:
                 import traceback
                 logger.error(f"Traceback: {traceback.format_exc()}")
             raise
+
+    def _initialize_pitch_detector(self) -> None:
+        """Inicializuje CREPE hybrid pitch detector"""
+        self.pitch_detector = CrepeHybridDetector()
+
+        # Relaxed validace pro rozladěné piano (ponecháváme pro kompatibilitu)
+        def relaxed_validation(freq):
+            """Relaxed validation pro rozladěné piano"""
+            if not (self.pitch_detector.fmin <= freq <= self.pitch_detector.fmax):
+                logger.info(f"  Frequency {freq:.2f} Hz outside piano range")
+                return False
+
+            # CREPE je přesný, takže můžeme být méně tolerantní
+            distances = np.abs(self.pitch_detector.piano_frequencies - freq)
+            min_idx = np.argmin(distances)
+            closest_piano_freq = self.pitch_detector.piano_frequencies[min_idx]
+            cents_difference = 1200 * np.log2(freq / closest_piano_freq)
+
+            logger.info(f"  Detected: {freq:.2f} Hz, Closest piano: {closest_piano_freq:.2f} Hz")
+            logger.info(f"  Piano detuning: {cents_difference:+.1f} cents")
+
+            # CREPE tolerance - 120 centů (1.2 půltónu)
+            if abs(cents_difference) <= 120:
+                logger.info(f"  Validation: PASS (CREPE detection within ±120 cents)")
+                return True
+            else:
+                logger.info(f"  Validation: FAIL (detuning {abs(cents_difference):.1f} cents > 120)")
+                return False
+
+        # Přepíšeme validaci
+        self.pitch_detector._validate_frequency = relaxed_validation
+
+        logger.info("Initialized CREPE hybrid pitch detector")
+        logger.info(f"Piano frequency range: {self.pitch_detector.fmin:.1f} - {self.pitch_detector.fmax:.1f} Hz")
+        logger.info("Using CREPE neural network for primary detection")
+        logger.info("Applied validation for detuned piano (±120 cents)")
 
     def _phase1_amplitude_analysis(self) -> List[AudioSampleLite]:
         """Fáze 1: Rychlá analýza amplitud všech souborů"""
@@ -236,20 +269,16 @@ class TwoPhaseRefactoredPitchCorrector:
             return {"thresholds": [], "num_samples": 0}
 
         # Extrakce amplitud pro mapping
-        max_amplitudes = [s.max_amplitude for s in lite_samples]
         rms_amplitudes = [s.rms_amplitude for s in lite_samples]
 
-        # Použij RMS jako primární metriku (stabilnější než max)
-        primary_values = rms_amplitudes
-
         # Odstranění outliers
-        q1, q3 = np.percentile(primary_values, [25, 75])
+        q1, q3 = np.percentile(rms_amplitudes, [25, 75])
         iqr = q3 - q1
         lower_bound = q1 - 1.5 * iqr
         upper_bound = q3 + 1.5 * iqr
 
-        filtered_values = [v for v in primary_values if lower_bound <= v <= upper_bound]
-        outliers_removed = len(primary_values) - len(filtered_values)
+        filtered_values = [v for v in rms_amplitudes if lower_bound <= v <= upper_bound]
+        outliers_removed = len(rms_amplitudes) - len(filtered_values)
 
         if outliers_removed > 0:
             logger.info(f"Removed {outliers_removed} outliers from amplitude data")
@@ -287,7 +316,6 @@ class TwoPhaseRefactoredPitchCorrector:
 
         # Logování distribuce
         self._log_velocity_distribution(lite_samples)
-
         return mapping
 
     def _assign_velocity_from_amplitude(self, amplitude: float, thresholds: List[float]) -> int:
@@ -311,16 +339,8 @@ class TwoPhaseRefactoredPitchCorrector:
             percentage = (count / total_samples * 100) if total_samples > 0 else 0
             logger.info(f"  Velocity {vel}: {count} samples ({percentage:.1f}%)")
 
-    def _initialize_pitch_detector(self) -> None:
-        """Inicializuje piano pitch detector"""
-        # Pouze piano detector - ostatní odstraněny
-        self.pitch_detector = PianoPitchDetector()
-        logger.info("Initialized piano pitch detector")
-        logger.info(f"Piano frequency range: {self.pitch_detector.fmin:.1f} - {self.pitch_detector.fmax:.1f} Hz")
-        logger.info(f"Piano keys available: {len(self.pitch_detector.piano_frequencies)}")
-
     def _phase2_full_processing(self, lite_samples: List[AudioSampleLite],
-                               velocity_mapping: Dict) -> List[AudioSampleData]:
+                                velocity_mapping: Dict) -> List[AudioSampleData]:
         """Fáze 2: Plná pitch detection a OKAMŽITÉ uložení"""
         logger.info(f"Processing {len(lite_samples)} samples with immediate export...")
 
@@ -337,43 +357,40 @@ class TwoPhaseRefactoredPitchCorrector:
                 # Plné načtení souboru pro pitch detection
                 waveform, sr = sf.read(str(lite_sample.filepath))
 
-                # Ensure 2D format
+                # Konverze na float32 pro Aubio kompatibilitu
+                waveform = waveform.astype(np.float32)
+
+                # Ensure 2D format pro velocity analysis
                 if len(waveform.shape) == 1:
                     waveform = waveform[:, np.newaxis]
 
-                # Pitch analýza
-                mono_audio = AudioUtils.to_mono(waveform)
-                pitch_analysis = self._perform_pitch_analysis(mono_audio, sr)
+                # Pitch analysis - předej celý waveform, detector si udělá mono konverzi
+                pitch_analysis = self._perform_pitch_analysis(waveform, sr)
 
                 if pitch_analysis.fundamental_freq is None:
                     logger.warning(f"Pitch detection failed for {lite_sample.filepath.name}")
                     failed += 1
                     continue
 
-                # Vytvoř plný AudioSampleData
-                duration = len(waveform) / sr
+                # Velocity analysis
+                velocity_analysis = self.velocity_analyzer.analyze(waveform, sr)
+                assigned_velocity = lite_sample.assigned_velocity  # Z fáze 1
+
+                # Vytvoř plný sample objekt
                 sample = AudioSampleData(
                     filepath=lite_sample.filepath,
                     waveform=waveform,
                     sample_rate=sr,
-                    duration=duration,
+                    duration=lite_sample.duration,
                     pitch_analysis=pitch_analysis,
-                    velocity_analysis=None,  # Nepotřebujeme pro tuto fázi
-                    assigned_velocity=lite_sample.assigned_velocity
+                    velocity_analysis=velocity_analysis,
+                    assigned_velocity=assigned_velocity
                 )
 
-                processed_samples.append(sample)
-
-                # Validace pro piano
-                validation = self._validate_piano_detection(pitch_analysis, lite_sample.filepath.name)
-                if not validation["valid"]:
-                    logger.warning(f"  {validation['reason']}")
-                    continue
-
-                # Log analýzy
+                # Log výsledků
                 self._log_analysis_results(sample)
 
-                # Určení cílové MIDI noty
+                # Target MIDI note
                 target_midi = self._find_target_midi_note(pitch_analysis.fundamental_freq)
                 if target_midi is None:
                     logger.warning("Cannot determine target MIDI note, skipping")
@@ -429,13 +446,13 @@ class TwoPhaseRefactoredPitchCorrector:
 
         # Log round-robin statistik
         self._log_round_robin_statistics(sample_counters)
-
         return processed_samples
 
-    def _perform_pitch_analysis(self, mono_audio: np.ndarray, sr: int):
+    def _perform_pitch_analysis(self, waveform: np.ndarray, sr: int):
         """Provede pitch analýzu s error handling"""
         try:
-            return self.pitch_detector.detect(mono_audio, sr)
+            # Detector očekává waveform (mono/stereo), udělá si vlastní konverzi
+            return self.pitch_detector.detect(waveform, sr)
         except Exception as e:
             logger.error(f"Pitch detection error: {e}")
             from audio_utils import PitchAnalysisResult
@@ -448,27 +465,8 @@ class TwoPhaseRefactoredPitchCorrector:
                 spectral_rolloff=sr/2
             )
 
-    def _validate_piano_detection(self, pitch_analysis, filename: str) -> Dict[str, any]:
-        """Validace specifická pro piano detection"""
-        freq = pitch_analysis.fundamental_freq
-
-        if freq is None:
-            return {"valid": False, "reason": "No fundamental frequency detected"}
-
-        if not (27.5 <= freq <= 4186.0):
-            return {"valid": False, "reason": f"Frequency {freq:.2f} Hz outside piano range"}
-
-        piano_frequencies = self.pitch_detector.piano_frequencies
-        distances = np.abs(piano_frequencies - freq)
-        min_distance = np.min(distances)
-
-        if min_distance > freq * 0.03:
-            logger.warning(f"Detected frequency {freq:.2f} Hz is not close to any piano key")
-
-        return {"valid": True, "reason": "OK"}
-
     def _log_analysis_results(self, sample: AudioSampleData) -> None:
-        """Logování výsledků analýzy"""
+        """Rozšířené logování pro vylepšený detector a rozladěné piano"""
         pitch = sample.pitch_analysis
         freq = pitch.fundamental_freq
         midi = pitch.midi_note
@@ -477,25 +475,29 @@ class TwoPhaseRefactoredPitchCorrector:
         logger.info(f"  Detected frequency: {freq:.2f} Hz -> MIDI {midi} ({note_name})")
         logger.info(f"  Assigned velocity: {sample.assigned_velocity} (from amplitude analysis)")
         logger.info(f"  Confidence: {pitch.confidence:.3f}, Method: {pitch.method_used}")
-
-        # Piano-specific info
-        if isinstance(self.pitch_detector, PianoPitchDetector) and freq:
-            piano_distances = np.abs(self.pitch_detector.piano_frequencies - freq)
-            min_idx = np.argmin(piano_distances)
-            closest_piano_freq = self.pitch_detector.piano_frequencies[min_idx]
-            distance_cents = 1200 * np.log2(freq / closest_piano_freq)
-            logger.info(f"  Closest piano frequency: {closest_piano_freq:.2f} Hz ({distance_cents:+.1f} cents)")
+        logger.info(f"  Harmonics detected: {len(pitch.harmonics)}")
 
     def _find_target_midi_note(self, freq: float) -> Optional[int]:
-        """Najde nejbližší MIDI notu"""
+        """Najde nejbližší MIDI notu pro rozladěné piano"""
         try:
-            if isinstance(self.pitch_detector, PianoPitchDetector):
+            if hasattr(self.pitch_detector, 'piano_frequencies'):
+                # Pro rozladěné piano - najdi nejbližší piano frekvenci
                 piano_distances = np.abs(self.pitch_detector.piano_frequencies - freq)
                 min_idx = np.argmin(piano_distances)
                 closest_piano_freq = self.pitch_detector.piano_frequencies[min_idx]
+
+                # Vypočítej MIDI notu z nejbližší piano frekvence (ne z detekované)
                 midi_float = 12 * np.log2(closest_piano_freq / 440.0) + 69
                 midi_note = int(np.round(midi_float))
+
+                # Debug info pro rozladěné piano
+                cents_off = 1200 * np.log2(freq / closest_piano_freq)
+                note_name = AudioUtils.midi_to_note_name(midi_note)
+                logger.debug(f"Target note: MIDI {midi_note} ({note_name}) = {closest_piano_freq:.2f} Hz")
+                logger.debug(f"Piano is {cents_off:+.1f} cents off from standard tuning")
+
             else:
+                # Fallback - standardní výpočet
                 midi_float = 12 * np.log2(freq / 440.0) + 69
                 midi_note = int(np.round(midi_float))
 
@@ -524,7 +526,7 @@ class TwoPhaseRefactoredPitchCorrector:
 
     def _log_correction_info(self, sample: AudioSampleData, correction: Dict,
                             rr_index: int, skip_correction: bool) -> None:
-        """Logování informací o korekci"""
+        """Logování informací o korekci pro rozladěné piano"""
         note_name = AudioUtils.midi_to_note_name(sample.target_midi_note)
 
         if rr_index == 0:
@@ -534,8 +536,14 @@ class TwoPhaseRefactoredPitchCorrector:
 
         logger.info(f"  Pitch correction: {correction['semitones']:+.3f} semitones ({correction['cents']:+.1f} cents)")
 
+        # Extra info pro rozladěné piano
+        if abs(correction['cents']) > 50:
+            logger.info(f"  Large correction needed due to piano detuning")
+
         if skip_correction:
             logger.info(f"  Correction skipped (below {self.min_correction_cents:.1f} cent threshold)")
+        else:
+            logger.info(f"  Applying pitch correction")
 
     def _apply_pitch_correction(self, sample: AudioSampleData, semitones: float) -> tuple:
         """Aplikace pitch korekce"""
@@ -574,10 +582,7 @@ class TwoPhaseRefactoredPitchCorrector:
         return self.output_dir / f"{base_name}.wav"
 
     def _log_round_robin_statistics(self, sample_counters: defaultdict) -> None:
-        """
-        Loguje statistiky round-robin distribuce (počty vzorků pro každou kombinaci MIDI + velocity).
-        Pomáhá ověřit rovnoměrnou distribuci vzorků.
-        """
+        """Loguje statistiky round-robin distribuce"""
         logger.info("\n=== ROUND-ROBIN STATISTICS ===")
         total_rr_samples = sum(sample_counters.values())
         logger.info(f"Total round-robin samples: {total_rr_samples}")
@@ -618,14 +623,6 @@ class TwoPhaseRefactoredPitchCorrector:
             percentage = (count / total * 100) if total > 0 else 0
             logger.info(f"  Velocity {vel}: {count} samples ({percentage:.1f}%)")
 
-        # Pitch detection úspěšnost
-        if processed_samples:
-            confidences = [s.pitch_analysis.confidence for s in processed_samples
-                          if s.pitch_analysis.fundamental_freq is not None]
-            if confidences:
-                avg_confidence = np.mean(confidences)
-                logger.info(f"Average pitch confidence: {avg_confidence:.3f}")
-
 
 def parse_arguments():
     """Parsování argumentů"""
@@ -652,10 +649,6 @@ Výhody:
                        help='Délka attack fáze pro velocity detection (default: 0.5s)')
     parser.add_argument('--min-correction-cents', type=float, default=33.33,
                        help='Minimální korekce v centech (default: 33.33 = 1/3 pultonu)')
-    parser.add_argument('--detector',
-                       choices=['piano', 'hybrid', 'simple', 'adaptive'],
-                       default='piano',
-                       help='Typ pitch detectoru (default: piano)')
     parser.add_argument('--verbose', action='store_true',
                        help='Verbose logging pro debugging')
 

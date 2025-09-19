@@ -91,77 +91,91 @@ class AudioUtils:
 
     @staticmethod
     def normalize_audio(waveform: np.ndarray, target_db: float = -20.0) -> np.ndarray:
-        """Normalizace audio na cílovou úroveň"""
+        """Normalizace audio na cílovou úroveň s float32 výstupem"""
+        # Ensure float32 input
+        waveform = waveform.astype(np.float32)
+
         if len(waveform.shape) > 1:
             rms = np.sqrt(np.mean(waveform.flatten() ** 2))
         else:
             rms = np.sqrt(np.mean(waveform ** 2))
 
         if rms == 0:
-            return waveform
+            return waveform.astype(np.float32)
 
         target_rms = 10 ** (target_db / 20)
-        return waveform * (target_rms / rms)
+        normalized = waveform * (target_rms / rms)
+
+        return normalized.astype(np.float32)
 
     @staticmethod
     def to_mono(waveform: np.ndarray, method: str = "mean") -> np.ndarray:
         """
-        Převod na mono s volbou metody.
+        Převod na mono s volbou metody a float32 výstupem.
 
         Args:
             waveform: Input audio
             method: 'mean', 'left', 'right', 'mid_side'
         """
+        # Ensure float32 input
+        waveform = waveform.astype(np.float32)
+
         if len(waveform.shape) <= 1:
-            return waveform
+            return waveform.astype(np.float32)
 
         if waveform.shape[1] == 1:
-            return waveform[:, 0]
+            return waveform[:, 0].astype(np.float32)
 
         if method == "mean":
-            return np.mean(waveform, axis=1)
+            return np.mean(waveform, axis=1).astype(np.float32)
         elif method == "left":
-            return waveform[:, 0]
+            return waveform[:, 0].astype(np.float32)
         elif method == "right":
-            return waveform[:, 1] if waveform.shape[1] > 1 else waveform[:, 0]
+            return (waveform[:, 1] if waveform.shape[1] > 1 else waveform[:, 0]).astype(np.float32)
         elif method == "mid_side" and waveform.shape[1] >= 2:
             # Mid channel pro mono conversion
-            return (waveform[:, 0] + waveform[:, 1]) / 2
+            return ((waveform[:, 0] + waveform[:, 1]) / 2).astype(np.float32)
         else:
-            return np.mean(waveform, axis=1)
+            return np.mean(waveform, axis=1).astype(np.float32)
 
     @staticmethod
     def ensure_format(waveform: np.ndarray, target_channels: int = 1) -> np.ndarray:
-        """Zajistí správný formát audio (mono/stereo)"""
+        """Zajistí správný formát audio (mono/stereo) s float32 výstupem"""
+        # Ensure float32 input
+        waveform = waveform.astype(np.float32)
+
         if target_channels == 1:
             return AudioUtils.to_mono(waveform)
         elif target_channels == 2:
             if len(waveform.shape) == 1:
                 # Mono -> stereo (duplicate)
-                return np.column_stack([waveform, waveform])
+                return np.column_stack([waveform, waveform]).astype(np.float32)
             elif waveform.shape[1] == 1:
                 # Mono column -> stereo
-                return np.column_stack([waveform[:, 0], waveform[:, 0]])
+                return np.column_stack([waveform[:, 0], waveform[:, 0]]).astype(np.float32)
             else:
-                return waveform
+                return waveform.astype(np.float32)
         else:
             raise ValueError(f"Unsupported channel count: {target_channels}")
 
     @staticmethod
     def compute_spectrum(waveform: np.ndarray, sr: int, n_fft: int = 2048) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Výpočet spektra s caching možnostmi.
+        Výpočet spektra s caching možnostmi a float32 kompatibilitou.
         """
+        # Ensure float32 input
+        waveform = waveform.astype(np.float32)
+
         n_fft = min(n_fft, len(waveform))
         if n_fft < 64:  # Minimum pro smysluplnou analýzu
-            return np.array([]), np.array([])
+            return np.array([], dtype=np.float32), np.array([], dtype=np.float32)
 
         # Window pro lepší spektrální rozlišení
-        window = np.hanning(n_fft)
+        window = np.hanning(n_fft).astype(np.float32)
         windowed = waveform[:n_fft] * window
 
-        spectrum = np.abs(np.fft.fft(windowed))
-        freqs = np.fft.fftfreq(n_fft, 1/sr)
+        spectrum = np.abs(np.fft.fft(windowed)).astype(np.float32)
+        freqs = np.fft.fftfreq(n_fft, 1 / sr).astype(np.float32)
 
         # Pouze pozitivní frekvence
         half_len = n_fft // 2
@@ -169,16 +183,19 @@ class AudioUtils:
 
     @staticmethod
     def spectral_features(waveform: np.ndarray, sr: int) -> Tuple[float, float]:
-        """Výpočet spektrálních charakteristik"""
+        """Výpočet spektrálních charakteristik s float32 kompatibilitou"""
+        # Ensure float32 input
+        waveform = waveform.astype(np.float32)
+
         spectrum, freqs = AudioUtils.compute_spectrum(waveform, sr)
 
         if len(spectrum) == 0:
-            return 0.0, sr/2
+            return 0.0, sr / 2
 
         # Spektrální centroid
         total_energy = np.sum(spectrum)
         if total_energy > 0:
-            centroid = np.sum(freqs * spectrum) / total_energy
+            centroid = float(np.sum(freqs * spectrum) / total_energy)
         else:
             centroid = 0.0
 
@@ -187,9 +204,9 @@ class AudioUtils:
         if cumsum_spectrum[-1] > 0:
             rolloff_threshold = 0.85 * cumsum_spectrum[-1]
             rolloff_idx = np.where(cumsum_spectrum >= rolloff_threshold)[0]
-            rolloff = freqs[rolloff_idx[0]] if len(rolloff_idx) > 0 else sr/2
+            rolloff = float(freqs[rolloff_idx[0]]) if len(rolloff_idx) > 0 else sr / 2
         else:
-            rolloff = sr/2
+            rolloff = sr / 2
 
         return centroid, rolloff
 
@@ -283,16 +300,21 @@ class OptimizedFilters:
         return filtered
 
 
+# Opravy pro AudioProcessor třídu v audio_utils.py
+
 class AudioProcessor:
     """
-    Unified audio processor pro stereo/mono handling a sample rate conversion.
+    Unified audio processor pro stereo/mono handling a sample rate conversion s float32 kompatibilitou.
     """
 
     @staticmethod
     def resample_audio(audio: np.ndarray, from_sr: int, to_sr: int) -> np.ndarray:
-        """Univerzální resampling pro mono i stereo"""
+        """Univerzální resampling pro mono i stereo s float32 výstupem"""
         if from_sr == to_sr:
-            return audio
+            return audio.astype(np.float32)
+
+        # Ensure float32 input
+        audio = audio.astype(np.float32)
 
         try:
             if len(audio.shape) > 1 and audio.shape[1] > 1:
@@ -300,36 +322,43 @@ class AudioProcessor:
                 resampled_channels = []
                 for ch in range(audio.shape[1]):
                     resampled = resampy.resample(audio[:, ch], from_sr, to_sr)
-                    resampled_channels.append(resampled)
+                    resampled_channels.append(resampled.astype(np.float32))
                 return np.column_stack(resampled_channels)
             else:
                 # Mono
                 audio_1d = audio.flatten() if len(audio.shape) > 1 else audio
-                resampled = resampy.resample(audio_1d, from_sr, to_sr)
+                resampled = resampy.resample(audio_1d, from_sr, to_sr).astype(np.float32)
                 return resampled[:, np.newaxis] if len(audio.shape) > 1 else resampled
 
         except Exception as e:
             logger.error(f"Resampling error: {e}")
-            return audio
+            return audio.astype(np.float32)
 
     @staticmethod
     def pitch_shift(audio: np.ndarray, sr: int, semitones: float) -> Tuple[np.ndarray, int]:
-        """Pitch shift s unified handling"""
+        """Pitch shift s unified handling a float32 výstupem"""
         if abs(semitones) < 0.01:
-            return audio, sr
+            return audio.astype(np.float32), sr
+
+        # Ensure float32 input
+        audio = audio.astype(np.float32)
 
         factor = 2 ** (semitones / 12)
         new_sr = int(sr * factor)
 
         try:
-            return AudioProcessor.resample_audio(audio, sr, new_sr), new_sr
+            resampled = AudioProcessor.resample_audio(audio, sr, new_sr)
+            return resampled.astype(np.float32), new_sr
         except Exception as e:
             logger.error(f"Pitch shift error: {e}")
-            return audio, sr
+            return audio.astype(np.float32), sr
 
     @staticmethod
     def calculate_stereo_width(waveform: np.ndarray) -> Optional[float]:
-        """Výpočet stereo width pro velocity analýzu"""
+        """Výpočet stereo width pro velocity analýzu s float32 kompatibilitou"""
+        # Ensure float32 input
+        waveform = waveform.astype(np.float32)
+
         if len(waveform.shape) < 2 or waveform.shape[1] < 2:
             return None
 
@@ -340,4 +369,4 @@ class AudioProcessor:
         correlation = np.corrcoef(left, right)[0, 1]
 
         # Stereo width (vyšší = více stereo)
-        return 1.0 - abs(correlation)
+        return float(1.0 - abs(correlation))
